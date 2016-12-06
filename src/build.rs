@@ -11,6 +11,11 @@
 extern crate rustc_driver;
 extern crate syntax;
 
+use cargo::core::{PackageId, buf_shell};
+use cargo::ops::cargo_check::{prepare, Options};
+use cargo::ops::{compile_with_exec, Executor, Context};
+use cargo::util::{Config, ProcessBuilder, ProcessError, homedir};
+
 use vfs::Vfs;
 
 use self::rustc_driver::{RustcDefaultCalls, run_compiler, run};
@@ -25,7 +30,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::thread;
+use std::thread::{self, Thread};
 use std::time::Duration;
 
 
@@ -51,7 +56,7 @@ use std::time::Duration;
 /// it was squashed.
 pub struct BuildQueue {
     build_dir: Mutex<Option<PathBuf>>,
-    cmd_line_args: Mutex<Vec<String>>,
+    cmd_line_args: Arc<Mutex<Vec<String>>>,
     // True if a build is running.
     // Note I have been conservative with Ordering when accessing this atomic,
     // we might be able to do better.
@@ -91,11 +96,73 @@ enum Signal {
     Skip,
 }
 
+#[derive(Clone)]
+struct RlsExecutor {
+    cmd_line_args: Arc<Mutex<Vec<String>>>,
+    rls_thread: Thread,
+    cur_package_id: Option<PackageId>,
+}
+
+impl RlsExecutor {
+    fn new(cmd_line_args: Arc<Mutex<Vec<String>>>, rls_thread: Thread) -> RlsExecutor {
+        RlsExecutor {
+            cmd_line_args: cmd_line_args,
+            rls_thread: rls_thread,
+            cur_package_id: None,
+        }
+    }
+}
+
+impl Executor for RlsExecutor {
+    fn init(&mut self, cx: &Context) {
+        self.cur_package_id = Some(cx.current_package.clone());
+    }
+
+    fn exec(&self, cmd: ProcessBuilder, id: &PackageId) -> Result<bool, ProcessError> {
+        if id == self.cur_package_id.as_ref().expect("Executor has not been initialised") {
+            // TODO guess we should assert something about the cwd and the program being called
+            let mut args: Vec<_> = cmd.get_args().iter().map(|a| a.clone().into_string().unwrap()).collect();
+
+            args.insert(0, "rustc".to_owned());
+            args.push("--sysroot".to_owned());
+            let home = option_env!("RUSTUP_HOME").or(option_env!("MULTIRUST_HOME"));
+            let toolchain = option_env!("RUSTUP_TOOLCHAIN").or(option_env!("MULTIRUST_TOOLCHAIN"));
+            let sys_root = if let (Some(home), Some(toolchain)) = (home, toolchain) {
+                format!("{}/toolchains/{}", home, toolchain)
+            } else {
+                option_env!("SYSROOT")
+                    .map(|s| s.to_owned())
+                    .or(Command::new("rustc")
+                        .arg("--print")
+                        .arg("sysroot")
+                        .output()
+                        .ok()
+                        .and_then(|out| String::from_utf8(out.stdout).ok())
+                        .map(|s| s.trim().to_owned()))
+                    .expect("need to specify SYSROOT env var, \
+                             or use rustup or multirust")
+            };
+            args.push(sys_root.to_owned());
+
+            {
+                let mut queue_args = self.cmd_line_args.lock().unwrap();
+                *queue_args = args.clone();
+            }
+
+            self.rls_thread.unpark();
+            Ok(false)
+        } else {
+            cmd.exec()?;
+            Ok(true)
+        }
+    }
+}
+
 impl BuildQueue {
     pub fn new(vfs: Arc<Vfs>) -> BuildQueue {
         BuildQueue {
             build_dir: Mutex::new(None),
-            cmd_line_args: Mutex::new(vec![]),
+            cmd_line_args: Arc::new(Mutex::new(vec![])),
             running: AtomicBool::new(false),
             pending: Mutex::new(vec![]),
             vfs: vfs,
@@ -103,7 +170,7 @@ impl BuildQueue {
     }
 
     pub fn request_build(&self, build_dir: &Path, priority: BuildPriority) -> BuildResult {
-        //println!("request_build, {} {:?}", build_dir, priority);
+        // println!("request_build, {:?} {:?}", build_dir, priority);
         // If there is a change in the project directory, then we can forget any
         // pending build and start straight with this new build.
         {
@@ -214,6 +281,7 @@ impl BuildQueue {
     // Runs a `cargo build`. Note that what we actually run is not at all like
     // `cargo build`, except in spirit.
     fn build(&self) -> BuildResult {
+        // TODO comment
         // When we build we are emulating `cargo build`, but trying to do so as
         // quickly as possible (FIXME(#24) we should add an option to do a real `cargo
         // build` for when the user wants to actually run the program).
@@ -239,139 +307,45 @@ impl BuildQueue {
         // they might be editing a dependent crate and so we blow away the cached
         // command line and run Cargo on the next build.
 
-        let mut cmd_line_args = self.cmd_line_args.lock().unwrap();
+        let needs_cargo_run = {
+            let cmd_line_args = self.cmd_line_args.lock().unwrap();
+            cmd_line_args.is_empty()
+        };
         let build_dir = &self.build_dir.lock().unwrap();
         let build_dir = build_dir.as_ref().unwrap();
+        // println!("build dir: {:?}", build_dir);
 
-        if cmd_line_args.is_empty() {
-            let mut cmd = Command::new("cargo");
-            // Using rustc rather than build means we can set flags which are
-            // used only on the last crate.
-            cmd.arg("rustc");
-            cmd.arg("-v");
-            cmd.arg("--");
-            // We add this argument so we know that the rustc call for the last
-            // crate will fail to build (no point wasting time when we'll do it
-            // ourselves later).
-            cmd.arg("--aBogusArgument");
-            cmd.env("RUSTFLAGS", "-Zunstable-options -Zsave-analysis --error-format=json \
-                                  -Zcontinue-parse-after-error -Zno-trans");
-            cmd.env("CARGO_TARGET_DIR", &Path::new("target").join("rls"));
-            cmd.current_dir(build_dir);
-
-            let new_cmd_line_args = match cmd.output() {
-                Ok(output) => {
-                    let out = String::from_utf8(output.stderr).unwrap();
-                    // println!("output: `{}`", out);
-                    let exit_str = "     Running `";
-
-                    match out.rfind(exit_str) {
-                        Some(i) => {
-                            let remaining = &out[i + exit_str.len() ..];
-                            let end = remaining.find('`').unwrap();
-                            let remaining = &remaining[..end];
-
-                            let mut result = vec![];
-
-                            const ARG_STRING_DEFAULT_CAPACITY: usize = 64;
-
-                            let mut in_quoted_arg = false;
-                            let mut in_escaped_character = false;
-                            let mut current_arg = String::with_capacity(ARG_STRING_DEFAULT_CAPACITY);
-
-                            for c in remaining.chars() {
-                                match (in_escaped_character, in_quoted_arg, c) {
-                                    // Opening quote of quoted arg
-                                    (false, false, '"') => { }
-
-                                    // End of current arg
-                                    (false, true, '"') | (false, false, ' ') =>
-                                        if !current_arg.is_empty() {
-                                            if current_arg != "--aBogusArgument" {
-                                                result.push(current_arg);
-                                            }
-
-                                            current_arg = String::with_capacity(ARG_STRING_DEFAULT_CAPACITY);
-                                        },
-
-                                    // Part of current arg, regular character
-                                    (false, _, c) if c != '\\' =>
-                                        current_arg.push(c),
-
-                                    // Part of current arg, beginning of escaped character
-                                    (false, _, _) =>
-                                        in_escaped_character = true,
-
-                                    // Part of current arg, end of escaped character
-                                    (true, _, c) => {
-                                        // Paths on Windows contain backslashes and cargo doesn't escape them
-                                        if cfg!(windows) && c != '"' {
-                                            current_arg.push('\\');
-                                        }
-                                        current_arg.push(c);
-                                        in_escaped_character = false;
-                                    }
-                                }
-
-                                if c == '"' {
-                                    in_quoted_arg = !in_quoted_arg;
-                                }
-                            }
-
-                            if !current_arg.is_empty() {
-                                if current_arg != "--aBogusArgument" {
-                                    result.push(current_arg);
-                                }
-                            }
-
-                            assert!(!in_quoted_arg);
-
-                            result.push("--sysroot".into());
-                            let home = option_env!("RUSTUP_HOME")
-                                               .or(option_env!("MULTIRUST_HOME"));
-                            let toolchain = option_env!("RUSTUP_TOOLCHAIN")
-                                                    .or(option_env!("MULTIRUST_TOOLCHAIN"));
-                            let sys_root = if let (Some(home), Some(toolchain)) = (home, toolchain) {
-                                format!("{}/toolchains/{}", home, toolchain)
-                            } else {
-                                option_env!("SYSROOT")
-                                    .map(|s| s.to_owned())
-                                    .or(Command::new("rustc")
-                                        .arg("--print")
-                                        .arg("sysroot")
-                                        .output()
-                                        .ok()
-                                        .and_then(|out| String::from_utf8(out.stdout).ok())
-                                        .map(|s| s.trim().to_owned()))
-                                    .expect("need to specify SYSROOT env var, \
-                                             or use rustup or multirust")
-                            };
-                            result.push(sys_root.into());
-
-                            result
-                        }
-
-                        None => {
-                            // println!("Couldn't parse stderr: `{}`", out);
-                            return BuildResult::Err;
-                        }
-                    }
-                }
-                Err(_) => {
-                    // println!("Error waiting for Cargo process: {:?}", e);
-                    return BuildResult::Err;
-                }
-            };
-
-            *cmd_line_args = new_cmd_line_args;
+        if needs_cargo_run {
+            let mut exec = RlsExecutor::new(self.cmd_line_args.clone(), thread::current());
+            let build_dir = build_dir.clone();
+            // TODO comment on spawn
+            thread::spawn(move || {
+                // TODO prepare is a bad name
+                // TODO convert unwraps to build errors
+                // TODO bin metadata crates
+                env::set_var("CARGO_TARGET_DIR", &Path::new("target").join("rls"));
+                env::set_var("RUSTFLAGS", "-Zunstable-options -Zsave-analysis --error-format=json \
+                                           -Zcontinue-parse-after-error -Zno-trans");
+                let out = Arc::new(Mutex::new(vec![]));
+                let err = Arc::new(Mutex::new(vec![]));
+                let shell = buf_shell(out.clone(), err.clone());
+                let config = Config::new(shell, build_dir.clone(), homedir(&build_dir).unwrap());
+                prepare(Options::default(), &config, |ws, opts| {
+                    compile_with_exec(ws, opts, &mut exec)?;
+                    Ok(Some(()))
+                }).unwrap();
+            });
+            thread::park();
         }
 
+        let cmd_line_args = self.cmd_line_args.lock().unwrap();
+        assert!(!cmd_line_args.is_empty());
         self.rustc(cmd_line_args.clone(), build_dir)
     }
 
     // Runs a single instance of rustc. Runs in-process.
     fn rustc(&self, args: Vec<String>, build_dir: &Path) -> BuildResult {
-        println!("args: `{:?}`", args);
+        //println!("rustc - args: `{:?}`", args);
 
         let changed = self.vfs.get_cached_files();
 

@@ -63,7 +63,7 @@ impl ActionHandler {
     pub fn build(&self, project_path: &Path, priority: BuildPriority, out: &Output) {
         out.notify("rustDocument/diagnosticsBegin");
 
-        println!("build {:?}", project_path);
+        debug!("build {:?}", project_path);
         let result = self.build_queue.request_build(project_path, priority);
         match result {
             BuildResult::Success(ref x) | BuildResult::Failure(ref x) => {
@@ -318,14 +318,16 @@ impl ActionHandler {
 
         // Racer thread.
         let racer_handle = thread::spawn(move || {
-            let file_path = &parse_file_path(&params.text_document.uri).unwrap();
+            // TODO re-enable Racer
+            // let file_path = &parse_file_path(&params.text_document.uri).unwrap();
 
-            let cache = racer::FileCache::new(vfs);
-            let session = racer::Session::new(&cache);
-            let location = pos_to_racer_location(&params.position);
+            // let cache = racer::FileCache::new(vfs);
+            // let session = racer::Session::new(&cache);
+            // let location = pos_to_racer_location(&params.position);
 
-            racer::find_definition(file_path, location, &session)
-                .and_then(location_from_racer_match)
+            // racer::find_definition(file_path, location, &session)
+            //     .and_then(location_from_racer_match)
+            None
         });
 
         thread::park_timeout(Duration::from_millis(::COMPILER_TIMEOUT));
